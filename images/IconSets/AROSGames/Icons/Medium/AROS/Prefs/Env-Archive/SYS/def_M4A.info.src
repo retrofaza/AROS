@@ -1,0 +1,4 @@
+TYPE = PROJECT
+TOOLTYPE = GUI
+DEFAULTTOOL = Extras:MultiMedia/Audio/MPlayer/MPlayer
+STACK = 512000
