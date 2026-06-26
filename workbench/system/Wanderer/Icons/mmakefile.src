@@ -11,7 +11,7 @@ EXTRAICONS := \
    drawer file
 
 
-%build_icons mmake=workbench-system-wanderer-mainicons icons=$(MAINICONS) \
+%build_dual_icons mmake=workbench-system-wanderer-mainicons icons=$(MAINICONS) \
              dir=$(AROS_SYSTEM)/Wanderer
 
 %build_icons mmake=workbench-system-wanderer-extraicons icons=$(EXTRAICONS) \

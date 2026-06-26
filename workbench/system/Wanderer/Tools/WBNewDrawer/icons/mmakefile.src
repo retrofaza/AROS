@@ -7,7 +7,7 @@ EXEDIR := \
 
 ICONS := WBNewDrawer
 
-%build_icons mmake=workbench-system-wanderer-tools-wbnewdrawer-icons icons=$(ICONS) \
+%build_dual_icons mmake=workbench-system-wanderer-tools-wbnewdrawer-icons icons=$(ICONS) \
              dir=$(EXEDIR)
 
 %common

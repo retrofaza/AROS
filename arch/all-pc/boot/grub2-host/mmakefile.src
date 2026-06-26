@@ -46,6 +46,9 @@ $(BOOT_GRUB):
 $(BOOT_GRUB)/fonts:
 	%mkdirs_q $@
 
+$(BOOT_GRUB)/themes/AROSGames:
+	%mkdirs_q $@
+
 $(BOOT_GRUB)/i386-pc:
 	%mkdirs_q $@
 
@@ -53,6 +56,9 @@ $(BOOT_EFI):
 	%mkdirs_q $@
 
 $(BOOT_EFI)/fonts:
+	%mkdirs_q $@
+
+$(BOOT_EFI)/themes/AROSGames:
 	%mkdirs_q $@
 
 $(BOOT_EFI)/$(AROS_TARGET_CPU)-efi:
@@ -70,13 +76,19 @@ $(DESTDIR)/share/grub:
 	%mkdirs_q $@
 
 #MM
-bootloader-grub2gfx-common: $(BOOT_GRUB)/splash.png $(BOOT_EFI)/splash.png
+bootloader-grub2gfx-common: $(BOOT_GRUB)/splash.png $(BOOT_EFI)/splash.png $(BOOT_GRUB)/themes/AROSGames/theme.txt $(BOOT_EFI)/themes/AROSGames/theme.txt
 
 $(BOOT_GRUB)/splash.png: $(SPLASHIMAGE) | $(BOOT_GRUB)
 		$(CP) $< $@
 
 $(BOOT_EFI)/splash.png: $(SPLASHIMAGE) | $(BOOT_EFI)
 		$(CP) $< $@
+
+$(BOOT_GRUB)/themes/AROSGames/theme.txt: $(SRCDIR)/images/Boot/Grub2/themes/AROSGames/theme.txt | $(BOOT_GRUB)/themes/AROSGames
+	$(CP) $(SRCDIR)/images/Boot/Grub2/themes/AROSGames/* $(BOOT_GRUB)/themes/AROSGames/
+
+$(BOOT_EFI)/themes/AROSGames/theme.txt: $(SRCDIR)/images/Boot/Grub2/themes/AROSGames/theme.txt | $(BOOT_EFI)/themes/AROSGames
+	$(CP) $(SRCDIR)/images/Boot/Grub2/themes/AROSGames/* $(BOOT_EFI)/themes/AROSGames/
 
 $(DESTDIR)/share/grub/unicode.pf2: unicode.pf2 | $(DESTDIR)/share/grub
 		$(CP) $< $@

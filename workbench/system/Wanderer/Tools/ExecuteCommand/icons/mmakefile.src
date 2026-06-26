@@ -4,5 +4,5 @@ include $(SRCDIR)/config/aros.cfg
 
 ICONS := ExecuteCommand
 
-%build_icons mmake=workbench-system-wanderer-tools-executecommand-icons \
+%build_dual_icons mmake=workbench-system-wanderer-tools-executecommand-icons \
              icons=$(ICONS) dir=$(AROS_WANDERER)/Tools

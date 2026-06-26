@@ -5,5 +5,5 @@ include $(SRCDIR)/config/aros.cfg
 ICONS := DiskInfo
 
 #MM- workbench-system-wanderer-tools-diskinfo-icons:
-%build_icons mmake=workbench-system-wanderer-tools-diskinfo-icons \
+%build_dual_icons mmake=workbench-system-wanderer-tools-diskinfo-icons \
              icons=$(ICONS) dir=$(AROS_WANDERER)/Tools

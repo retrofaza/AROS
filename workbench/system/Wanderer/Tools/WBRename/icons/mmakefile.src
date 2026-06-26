@@ -5,7 +5,7 @@ include $(SRCDIR)/config/aros.cfg
 ICONS := WBRename
 
 #MM workbench-system-wanderer-tools-wbrename-icons :
-%build_icons mmake=workbench-system-wanderer-tools-wbrename-icons icons=$(ICONS) \
+%build_dual_icons mmake=workbench-system-wanderer-tools-wbrename-icons icons=$(ICONS) \
              dir=$(AROS_WANDERER)/Tools
 
 #MM iconset-Gorilla-workbench-system-wanderer-tools-wbrename :
