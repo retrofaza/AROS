@@ -22,10 +22,7 @@ workbench-images-copylogo : $(AROS_IMAGES)/Logos/AROS.logo
 
 %copy_dir_recursive mmake=workbench-images-wallpapers src=$(SRCDIR)/images/Wallpapers dst=$(AROS_WALLPAPERS)
 
-#MM- workbench-images-themes : themes-ice themes-amigaos4x themes-xstream themes-arosdefault themes-amigaos3x
+#MM- workbench-images-themes : themes-ice themes-arosgames
 
 %copy_dir_recursive mmake=themes-ice src=$(SRCDIR)/images/Themes/Ice dst=$(AROS_THEMES)/Ice
-%copy_dir_recursive mmake=themes-amigaos4x src=$(SRCDIR)/images/Themes/AmigaOS4.x dst=$(AROS_THEMES)/AmigaOS4.x excludefiles=global.prefs
-%copy_dir_recursive mmake=themes-xstream src=$(SRCDIR)/images/Themes/Xstream dst=$(AROS_THEMES)/Xstream excludefiles=global.prefs
-%copy_dir_recursive mmake=themes-arosdefault src=$(SRCDIR)/images/Themes/AROSDefault dst=$(AROS_THEMES)/AROSDefault excludefiles=global.prefs
-%copy_dir_recursive mmake=themes-amigaos3x src=$(SRCDIR)/images/Themes/AmigaOS3.x dst=$(AROS_THEMES)/AmigaOS3.x excludefiles=global.prefs
+%copy_dir_recursive mmake=themes-arosgames src=$(SRCDIR)/images/Themes/AROSGames dst=$(AROS_THEMES)/AROSGames
