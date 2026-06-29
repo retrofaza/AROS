@@ -2,7 +2,7 @@
 
 include $(SRCDIR)/config/aros.cfg
 
-ADDITIONALICONS := ACPIToolPCITool 
+ADDITIONALICONS := ACPITool PCITool 
 
 #MM- iconset-AROSGames-additional-icons-aros-clean : iconset-AROSGames-additional-icons-aros-tools-hardware-clean
 #MM- iconset-AROSGames-additional-icons-aros-debug : iconset-AROSGames-additional-icons-aros-tools-hardware
