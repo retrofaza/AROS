@@ -23,7 +23,7 @@ struct IOUsbHWReq;
 struct timerequest;
 struct pciusbXHCIDevice *
 xhciCreateDeviceCtx(struct PCIController *hc, UWORD rootPortIndex, ULONG route, ULONG flags, UWORD mps0,
-                    struct timerequest *timerreq);
+                    UWORD ttHubAddr, UWORD ttHubPort, struct timerequest *timerreq);
 WORD xhciPrepareTransfer(struct IOUsbHWReq *ioreq, struct PCIUnit *unit, struct PCIDevice *base);
 LONG xhciPrepareEndpoint(struct IOUsbHWReq *ioreq);
 void xhciDestroyEndpoint(struct IOUsbHWReq *ioreq);
@@ -174,6 +174,8 @@ WORD xhciQueueData_IO(struct PCIController *hc, volatile struct pcisusbXHCIRing 
 
 ULONG xhciInitEP(struct PCIController *hc, struct pciusbXHCIDevice *devCtx, struct IOUsbHWReq *ioreq, UBYTE endpoint,
                  UBYTE dir, ULONG type, ULONG maxpacket, UWORD interval, ULONG flags);
+BOOL xhciUpdateEP0MaxPacket(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
+                            struct IOUsbHWReq *ioreq, struct timerequest *timerreq);
 void xhciScheduleAsyncTDs(struct PCIController *hc, struct List *txlist, ULONG txtype);
 void xhciScheduleIntTDs(struct PCIController *hc);
 void xhciScheduleIsoTDs(struct PCIController *hc);
@@ -192,6 +194,7 @@ void xhciStopIsochIO(struct PCIController *hc, struct RTIsoNode *rtn);
 LONG xhciCmdSubmit(struct PCIController *hc, APTR inctx_dma, ULONG trbflags, ULONG *resflags,
                    struct timerequest *timerreq);
 LONG xhciCmdSubmitAsync(struct PCIController *hc, APTR inctx_dma, ULONG trbflags, struct IOUsbHWReq *ioreq);
+void xhciDumpCmdTimeout(struct PCIController *hc, WORD queued);
 LONG xhciCmdSlotEnable(struct PCIController *hc, struct timerequest *timerreq);
 #if !defined(PCIUSB_INLINEXHCIOPS)
 void xhciRingDoorbell(struct PCIController *hc, ULONG slot, ULONG value);
@@ -262,7 +265,7 @@ static inline LONG xhciCmdSetTRDequeuePtr(struct PCIController *hc, ULONG slot, 
 #define xhciCmdContextEvaluate(hc,slot,dmaaddr,timerreq) \
     xhciCmdSubmit(hc, dmaaddr, (slot << 24) | TRBF_FLAG_CRTYPE_EVALUATE_CONTEXT, NULL, timerreq)
 #define xhciCmdNoOp(hc,slot,dmaaddr,timerreq) \
-    xhciCmdSubmit(hc, dmaaddr, TRBF_FLAG_TRTYPE_NOOP, NULL, timerreq)
+    xhciCmdSubmit(hc, dmaaddr, TRBF_FLAG_CRTYPE_NOOP, NULL, timerreq)
 #endif
 
 #if defined(PCIUSB_XHCI_DEBUG)
@@ -362,6 +365,19 @@ void xhciDumpCC(UBYTE completioncode);
     y.addr_lo = AROS_LONG2LE((ULONG)((IPTR)(z) & 0xFFFFFFFF)); \
     y.addr_hi = 0
 #endif
+
+/*
+ * The 64-bit operational registers are programmed as two 32-bit
+ * accesses, low half first: not every bridge or controller carries an
+ * eight byte register write whole. Pointer fields that live in memory
+ * are not affected.
+ */
+#define xhciSetPointerMMIO(x,y,z) \
+    do { \
+        y.addr_lo = AROS_LONG2LE((ULONG)((UQUAD)(IPTR)(z) & 0xFFFFFFFF)); \
+        y.addr_hi = ((x)->hc_Flags & HCF_ADDR64) ? \
+            AROS_LONG2LE((ULONG)((UQUAD)(IPTR)(z) >> 32)) : 0; \
+    } while (0)
 
 static inline struct xhci_trb *
 xhciTRBPointer(struct PCIController *hc, volatile struct xhci_trb *trb)

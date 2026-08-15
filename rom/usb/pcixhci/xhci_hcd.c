@@ -160,6 +160,9 @@ static UBYTE xhciCalcInterval(UWORD interval, ULONG flags, ULONG type)
 {
     const BOOL superspeed = (flags & UHFF_SUPERSPEED) != 0;
     const BOOL highspeed  = (flags & UHFF_HIGHSPEED)  != 0;
+    ULONG microframes;
+    UBYTE maxexp;
+    UBYTE exp;
 
     if((type != UHCMD_INTXFER) && (type != UHCMD_ISOXFER))
         return 0;
@@ -168,40 +171,40 @@ static UBYTE xhciCalcInterval(UWORD interval, ULONG flags, ULONG type)
         return 0;
 
     /*
-     * xHCI EP Context Interval semantics depend on speed and endpoint type:
+     * The service interval is always an exponent: the endpoint is serviced
+     * every 2^Interval microframes of 125us. What differs per speed and
+     * endpoint type is only the legal range (xHCI spec table 6-12):
      *
-     * - HS/SS Interrupt & Isoch: Interval is an exponent in microframes, where
-     *   the service interval is 2^(Interval) microframes.  USB bInterval is in
-     *   the range 1..16 and directly encodes that exponent (bInterval - 1).
+     * - HS/SS Interrupt & Isoch: 0..15
+     * - FS Isoch:                3..18
+     * - FS/LS Interrupt:         3..10
      *
-     * - FS Isoch: bInterval is 1..16 and encodes 2^(bInterval-1) frames.
-     *   Convert frames to microframes (x8) => exponent = (bInterval - 1) + 3.
-     *
-     * - FS/LS Interrupt: Interval is the frame count 1..255.
+     * Note that iouh_Interval is not the raw bInterval. poseidon.library
+     * normalises it when it builds the endpoint, and hands us a service
+     * interval count: microframes for HS/SS, frames for FS/LS.
      */
-    if(superspeed || highspeed) {
-        if(interval > 16)
-            interval = 16;
-        return (UBYTE)(interval - 1); /* 0..15 */
-    }
+    microframes = (superspeed || highspeed) ? (ULONG)interval : ((ULONG)interval * 8);
 
-    if(type == UHCMD_ISOXFER) {
-        UWORD exp;
+    if(superspeed || highspeed)
+        maxexp = 15;
+    else if(type == UHCMD_ISOXFER)
+        maxexp = 18;
+    else
+        maxexp = 10;
 
-        if(interval > 16)
-            interval = 16;
+    /*
+     * Round down. bInterval states the longest the device tolerates between
+     * services, so the next power of two below it is safe where the one above
+     * it is not - a mouse asking for 10ms polled every 16ms is the jerky
+     * movement this is meant to avoid.
+     */
+    for(exp = 0; (exp < maxexp) && ((2UL << exp) <= microframes); exp++)
+        ;
 
-        exp = (interval - 1) + 3; /* frames -> microframes */
-        if(exp > 15)
-            exp = 15;
+    if(!superspeed && !highspeed && (exp < 3))
+        exp = 3;
 
-        return (UBYTE)exp;
-    }
-
-    if(interval > 255)
-        interval = 255;
-
-    return (UBYTE)interval;
+    return exp;
 }
 
 void xhciInitRing(struct PCIController *hc, struct pcisusbXHCIRing *ring)
@@ -419,13 +422,13 @@ void xhciDisconnectDevice(struct PCIController *hc, struct pciusbXHCIDevice *dev
     xhciAbortDeviceQueue(hc, unit, &hc->hc_TDQueue, devCtx, FALSE);
     xhciAbortDeviceQueue(hc, unit, &hc->hc_PeriodicTDQueue, devCtx, TRUE);
 
-    if(devCtx->dc_DevAddr < USB_DEV_MAX &&
+    /* Release the address this device owned. Index 0 is deliberately left
+       alone: it is the default-address mapping every enumeration starts
+       from, not this device's property, and clearing it would strand the
+       next device on a port that sends no reset. */
+    if(devCtx->dc_DevAddr && devCtx->dc_DevAddr < USB_DEV_MAX &&
             unit->hu_DevControllers[devCtx->dc_DevAddr] == hc) {
         unit->hu_DevControllers[devCtx->dc_DevAddr] = NULL;
-    }
-    if(devCtx->dc_RouteString == 0 &&
-            unit->hu_DevControllers[0] == hc) {
-        unit->hu_DevControllers[0] = NULL;
     }
 
     xhciFreeDeviceCtx(hc, devCtx, TRUE, timerreq);
@@ -665,6 +668,31 @@ static void xhciDiagDumpOutputCtx(struct PCIController *hc,
 static inline UBYTE xhciEndpointState(volatile struct xhci_ep *epctx)
 {
     return (UBYTE)(AROS_LE2LONG(epctx->ctx[0]) & 0x7U);
+}
+
+/*
+ * The state an endpoint is in decides which command it will accept:
+ * Reset Endpoint only from Halted, Stop Endpoint only from Running or
+ * Stopped. The wrong one earns a Context State Error and leaves the
+ * endpoint exactly as it was.
+ */
+static UBYTE xhciEndpointStateOf(struct PCIController *hc,
+                                 struct pciusbXHCIDevice *devCtx, UBYTE epid)
+{
+    const UWORD ctxsize = (hc->hc_Flags & HCF_CTX64) ? 64 : 32;
+    volatile struct xhci_ep *epctx;
+
+    if(!hc || !devCtx || !devCtx->dc_SlotCtx.dmaa_Ptr ||
+       (epid >= MAX_DEVENDPOINTS))
+        return XHCI_EP_STATE_DISABLED;
+
+    epctx = (volatile struct xhci_ep *)
+            ((volatile UBYTE *)devCtx->dc_SlotCtx.dmaa_Ptr +
+             ((UWORD)epid * ctxsize));
+
+    CacheClearE((APTR)epctx, ctxsize, CACRF_InvalidateD);
+
+    return xhciEndpointState(epctx);
 }
 
 static const char *xhciEPStateName(UBYTE st)
@@ -1092,12 +1120,89 @@ ULONG xhciPageSize(struct PCIController *hc)
     return 0;
 }
 
+/*
+ * Tell the controller that a device is a hub, and how many ports it has.
+ *
+ * A slot context is built when the device first appears, long before the
+ * stack has read a descriptor and knows it is looking at a hub, so the hub
+ * fields are always zero at that point. They have to be right before any
+ * device behind the hub is addressed through it (xHCI 6.2.2), which is the
+ * one moment this can be done for every kind of hub - a SuperSpeed hub
+ * needs it as much as a USB 2.0 one, and only the latter ever announces
+ * itself by way of a split transaction.
+ *
+ * Must be called from a task context: it issues a command and waits.
+ */
+static BOOL xhciProgramHubSlot(struct PCIController *hc,
+                               struct pciusbXHCIDevice *hubCtx,
+                               struct timerequest *timerreq)
+{
+    volatile struct xhci_inctx *in;
+    volatile struct xhci_slot *islot;
+    volatile struct xhci_slot *oslot;
+    const UWORD ctxsize = (hc->hc_Flags & HCF_CTX64) ? 64 : 32;
+    UWORD ctxoff = (hc->hc_Flags & HCF_CTX64) ? 2 : 1;
+    ULONG nports;
+    LONG cc;
+
+    if(!hubCtx || (hubCtx == XHCI_ROOT_HUB_HANDLE) || !hubCtx->dc_SlotID)
+        return FALSE;
+
+    if(hubCtx->dc_HubProgrammed)
+        return TRUE;
+
+    if(!hubCtx->dc_IN.dmaa_Ptr || !hubCtx->dc_SlotCtx.dmaa_Ptr)
+        return FALSE;
+
+    in    = (volatile struct xhci_inctx *)hubCtx->dc_IN.dmaa_Ptr;
+    islot = xhciInputSlotCtx((struct xhci_inctx *)in, ctxoff);
+    oslot = (volatile struct xhci_slot *)hubCtx->dc_SlotCtx.dmaa_Ptr;
+
+    /* A hub whose descriptor was never seen gets the field's maximum
+       rather than a guess. */
+    nports = hubCtx->dc_NbrPorts;
+    if(!nports)
+        nports = 255;
+
+    /* Evaluate the slot context alone: its current state plus the hub
+       fields. */
+    CacheClearE((APTR)oslot, ctxsize, CACRF_InvalidateD);
+
+    in->dcf = 0;
+    in->acf = AROS_LONG2LE(0x01);
+    CopyMem((const void *)oslot, (void *)(APTR)islot, ctxsize);
+    islot->ctx[0] |= AROS_LONG2LE(1UL << 26);
+    islot->ctx[1] = AROS_LONG2LE(
+        (AROS_LE2LONG(islot->ctx[1]) & 0x00FFFFFF) | (nports << 24));
+
+    CacheClearE((APTR)in, hubCtx->dc_IN.dmaa_Entry.me_Length, CACRF_ClearD);
+
+    cc = xhciCmdEndpointConfigure(hc, hubCtx->dc_SlotID,
+                                  hubCtx->dc_IN.dmaa_Ptr, timerreq);
+
+    pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "hub slot %lu (%lu ports) update cc=%ld"
+                    DEBUGCOLOR_RESET" \n",
+                    (ULONG)hubCtx->dc_SlotID, nports, (long)cc);
+
+    if(cc != TRB_CC_SUCCESS) {
+        pciusbWarn("xHCI", DEBUGWARNCOLOR_SET
+                   "hub slot %lu update failed (cc=%ld)" DEBUGCOLOR_RESET" \n",
+                   (ULONG)hubCtx->dc_SlotID, (long)cc);
+        return FALSE;
+    }
+
+    hubCtx->dc_HubProgrammed = TRUE;
+    return TRUE;
+}
+
 struct pciusbXHCIDevice *
 xhciCreateDeviceCtx(struct PCIController *hc,
                     UWORD rootPortIndex,   /* 0-based */
                     ULONG route,           /* 20-bit route string (0 for root) */
                     ULONG flags,           /* UHFF_* speed / hub flags */
                     UWORD mps0,            /* initial EP0 max packet size */
+                    UWORD ttHubAddr,       /* TT hub USB address (0 if n/a) */
+                    UWORD ttHubPort,       /* port on the TT hub */
                     struct timerequest *timerreq)
 {
     struct XhciHCPrivate *xhcic = xhciGetHCPrivate(hc);
@@ -1199,6 +1304,15 @@ xhciCreateDeviceCtx(struct PCIController *hc,
     islot->ctx[0] &= ~(0xFUL << SLOTS_CTX_SPEED);
     islot->ctx[0] &= ~SLOTF_CTX_MTT;
 
+    /*
+     * A device reached through a transaction translator runs at low or full
+     * speed by definition; if it is also flagged high speed the flags are
+     * contradictory and naming the higher speed here costs a transaction
+     * error on the first transfer.
+     */
+    if(flags & UHFF_SPLITTRANS)
+        flags &= ~(UHFF_SUPERSPEED | UHFF_HIGHSPEED);
+
     if(flags & UHFF_SUPERSPEED)
         islot->ctx[0] |= SLOTF_CTX_SUPERSPEED;
     else if(flags & UHFF_HIGHSPEED)
@@ -1257,6 +1371,7 @@ xhciCreateDeviceCtx(struct PCIController *hc,
                      0,
                      flags);
 
+
     /*
      * Address Device requires the input EP0 EPSTATE to be Disabled (0) and
      * the Input Control Context add flags to include Slot+EP0. Be explicit
@@ -1272,6 +1387,82 @@ xhciCreateDeviceCtx(struct PCIController *hc,
     inctx->acf = 0;
     inctx->acf |= 0x01;       /* Slot context */
     inctx->acf |= (1UL << 1); /* EP0 context */
+
+    /*
+     * A low or full speed device behind a high speed hub is reached with
+     * split transactions, which the controller runs against the hub's
+     * transaction translator. Name the hub in the child's slot context,
+     * and make sure the hub's own slot says it is a hub first: nothing
+     * did when that slot was created, the device was only discovered to
+     * be a hub afterwards.
+     */
+    /*
+     * Whatever the speed, a device named by a route string is reached
+     * through a hub, and that hub's slot has to say so before this one is
+     * addressed. Only USB 2.0 hubs announce themselves below by owning a
+     * transaction translator; a SuperSpeed hub would otherwise never be
+     * described to the controller at all.
+     */
+    if(route & SLOT_CTX_ROUTE_MASK) {
+        ULONG parentRoute = route & SLOT_CTX_ROUTE_MASK;
+        int nib;
+
+        for(nib = 4; nib >= 0; nib--) {
+            if((parentRoute >> (nib * 4)) & 0xF) {
+                parentRoute &= ~(0xFUL << (nib * 4));
+                break;
+            }
+        }
+
+        (void)xhciProgramHubSlot(hc,
+                                 xhciFindRouteDevice(hc, parentRoute, rootPortIndex),
+                                 timerreq);
+    }
+
+    if(flags & UHFF_SPLITTRANS) {
+        struct pciusbXHCIDevice *parentCtx = NULL;
+        ULONG ttport = 0;
+        ULONG ttt = (flags >> UHFS_THINKTIME) & 0x3;
+
+        /*
+         * Poseidon names the hub owning the TT directly: the nearest high
+         * speed hub above the device, which is not the immediate parent
+         * when the device sits behind a full speed hub. Fall back to
+         * deriving the immediate parent from the route string.
+         */
+        if(ttHubAddr) {
+            parentCtx = xhciFindDeviceCtx(hc, ttHubAddr);
+            ttport = ttHubPort & 0xFF;
+        }
+
+        if(!parentCtx) {
+            ULONG parentRoute = route & SLOT_CTX_ROUTE_MASK;
+            int nib;
+
+            for(nib = 4; nib >= 0; nib--) {
+                ULONG v = (parentRoute >> (nib * 4)) & 0xF;
+                if(v) {
+                    ttport = v;
+                    parentRoute &= ~(0xFUL << (nib * 4));
+                    break;
+                }
+            }
+
+            parentCtx = xhciFindRouteDevice(hc, parentRoute, rootPortIndex);
+        }
+
+        if(parentCtx && parentCtx->dc_SlotID) {
+            (void)xhciProgramHubSlot(hc, parentCtx, timerreq);
+
+            islot->ctx[2] &= ~0x3FFFFUL;
+            islot->ctx[2] |= ((ULONG)parentCtx->dc_SlotID << SLOT_CTX_TT_SLOT_SHIFT) |
+                             (ttport << SLOT_CTX_TT_PORT_SHIFT) |
+                             (ttt << SLOT_CTX_TTT_SHIFT);
+        } else
+            pciusbWarn("xHCI", DEBUGWARNCOLOR_SET "no parent hub context for route %05x port %u"
+                       DEBUGCOLOR_RESET" \n", (unsigned)route, (unsigned)rootPortIndex);
+    }
+
     CacheClearE((APTR)devCtx->dc_IN.dmaa_Ptr, inctx_size, CACRF_ClearD);
 
     /* ---- Address Device ---- */
@@ -1476,9 +1667,21 @@ xhciObtainDeviceCtx(struct PCIController *hc,
     const BOOL forceScan = (ioreq->iouh_RootPort == 0);
     const BOOL haveSpeed = (flags & (UHFF_SUPERSPEED | UHFF_HIGHSPEED | UHFF_LOWSPEED)) != 0;
 
-    if(!haveSpeed || (mps0 == 0) || forceScan) {
+    if(!haveSpeed || (mps0 == 0) || forceScan)
         (void)xhciDerivePortFlagsAndMps0(hc, &rootPortIndex, &flags, &mps0, forceScan);
+
+    /*
+     * PORTSC describes whatever is attached to the root port, so for a device
+     * behind a hub it reports the hub's speed. That is right for a child
+     * sharing the hub's link, and wrong for one reached through a transaction
+     * translator - which by definition runs at low or full speed.
+     */
+    if(flags & UHFF_SPLITTRANS) {
+        flags &= ~(UHFF_SUPERSPEED | UHFF_HIGHSPEED);
+        if(mps0 > 64)
+            mps0 = 64;
     }
+
     if(mps0 == 0)
         mps0 = 8;
 
@@ -1487,7 +1690,86 @@ xhciObtainDeviceCtx(struct PCIController *hc,
                                route,
                                flags,
                                mps0,
+                               ioreq->iouh_SplitHubAddr,
+                               ioreq->iouh_SplitHubPort,
                                timerreq);
+}
+
+/*
+ * Full Speed devices only reveal bMaxPacketSize0 in the first eight bytes of
+ * their device descriptor, so enumeration opens EP0 at the mandatory minimum
+ * of 8. Once the stack knows the real size the endpoint context has to follow,
+ * or the device answers the next control transfer with packets larger than the
+ * controller expects and the transfer ends in a babble.
+ *
+ * Evaluate Context is the command for this: it is what the specification
+ * defines for a changed Max Packet Size on the default control endpoint
+ * (xHCI 1.2, section 4.6.7). Configure Endpoint does not cover EP0.
+ */
+BOOL xhciUpdateEP0MaxPacket(struct PCIController *hc,
+                            struct pciusbXHCIDevice *devCtx,
+                            struct IOUsbHWReq *ioreq,
+                            struct timerequest *timerreq)
+{
+    volatile struct xhci_slot *oslot;
+    ULONG oldmps;
+    LONG cc;
+
+    if(!devCtx || (devCtx == XHCI_ROOT_HUB_HANDLE) || !ioreq)
+        return TRUE;
+
+    if((ioreq->iouh_Endpoint != 0) || (ioreq->iouh_MaxPktSize == 0))
+        return TRUE;
+
+    if((ULONG)ioreq->iouh_MaxPktSize == devCtx->dc_EP0MaxPacket)
+        return TRUE;
+
+    if(!devCtx->dc_SlotCtx.dmaa_Ptr || !devCtx->dc_IN.dmaa_Ptr)
+        return TRUE;
+
+    /*
+     * Full Speed is the only speed that leaves the size open. Everywhere else
+     * the link fixes it, and the request cannot be trusted to agree: a High
+     * Speed device behind a hub has been seen asking for 8 - which is why the
+     * slot context, not the request, decides who is allowed to change it.
+     */
+    oslot = (volatile struct xhci_slot *)devCtx->dc_SlotCtx.dmaa_Ptr;
+    CacheClearE((APTR)oslot, sizeof(*oslot), CACRF_InvalidateD);
+
+    if(((AROS_LE2LONG(oslot->ctx[0]) >> SLOTS_CTX_SPEED) & 0xF) != SLOT_CTX_FULLSPEED)
+        return TRUE;
+
+    oldmps = devCtx->dc_EP0MaxPacket;
+
+    pciusbXHCIDebugEP("xHCI",
+                      DEBUGCOLOR_SET "Updating EP0 MPS: %lu -> %u (DevAddr=%u, Slot=%ld)" DEBUGCOLOR_RESET"\n",
+                      oldmps,
+                      ioreq->iouh_MaxPktSize,
+                      ioreq->iouh_DevAddr,
+                      devCtx->dc_SlotID);
+
+    if(!xhciInitEP(hc, devCtx, ioreq, 0, 0, UHCMD_CONTROLXFER,
+                   ioreq->iouh_MaxPktSize, 0, ioreq->iouh_Flags)) {
+        devCtx->dc_EP0MaxPacket = oldmps;
+        return FALSE;
+    }
+
+    cc = xhciCmdContextEvaluate(hc, devCtx->dc_SlotID, devCtx->dc_IN.dmaa_Ptr,
+                                timerreq);
+    if(cc != TRB_CC_SUCCESS) {
+        pciusbWarn("xHCI",
+                   DEBUGWARNCOLOR_SET "EP0 Evaluate Context failed (cc=%ld)" DEBUGCOLOR_RESET"\n",
+                   (LONG)cc);
+
+        /* Put the input context back to the size the controller is still
+           using, so it describes the endpoint as it actually stands rather
+           than one the command refused. xhciInitEP owns dc_EP0MaxPacket. */
+        (void)xhciInitEP(hc, devCtx, ioreq, 0, 0, UHCMD_CONTROLXFER,
+                         oldmps, 0, ioreq->iouh_Flags);
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 ULONG xhciInitEP(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
@@ -1586,6 +1868,11 @@ ULONG xhciInitEP(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
         ULONG route = (ULONG)(ioreq->iouh_RouteString & SLOT_CTX_ROUTE_MASK);
 
         slotctx0 |= route;
+
+        /* A device behind a transaction translator is low or full speed. */
+        if(flags & UHFF_SPLITTRANS)
+            flags &= ~(UHFF_SUPERSPEED | UHFF_HIGHSPEED);
+
         if(flags & UHFF_SUPERSPEED)
             slotctx0 |= SLOTF_CTX_SUPERSPEED;
         else if(flags & UHFF_HIGHSPEED)
@@ -1608,11 +1895,22 @@ ULONG xhciInitEP(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
         islot->ctx[1] |= ((ULONG)(ioreq->iouh_RootPort & 0xFF) << 16);
 
         if(flags & UHFF_SPLITTRANS) {
-            ULONG ttinfo = 0;
+            /*
+             * The slot context wants the TT hub's slot ID, but
+             * iouh_SplitHubAddr carries its USB address - resolve it. If
+             * the lookup fails, keep the TT fields Address Device already
+             * committed (mirrored from the output context above).
+             */
+            ULONG ttinfo = islot->ctx[2] &
+                ((0xFFUL << SLOT_CTX_TT_SLOT_SHIFT) | (0xFFUL << SLOT_CTX_TT_PORT_SHIFT));
             UWORD ttt = (UWORD)((flags >> UHFS_THINKTIME) & 0x3);
+            struct pciusbXHCIDevice *ttCtx =
+                xhciFindDeviceCtx(hc, ioreq->iouh_SplitHubAddr);
 
-            ttinfo |= ((ULONG)(ioreq->iouh_SplitHubAddr & 0xFF) << SLOT_CTX_TT_SLOT_SHIFT);
-            ttinfo |= ((ULONG)(ioreq->iouh_SplitHubPort & 0xFF) << SLOT_CTX_TT_PORT_SHIFT);
+            if(ttCtx && ttCtx->dc_SlotID) {
+                ttinfo = ((ULONG)ttCtx->dc_SlotID << SLOT_CTX_TT_SLOT_SHIFT) |
+                         ((ULONG)(ioreq->iouh_SplitHubPort & 0xFF) << SLOT_CTX_TT_PORT_SHIFT);
+            }
             ttinfo |= ((ULONG)ttt << SLOT_CTX_TTT_SHIFT);
 
             islot->ctx[2] = ttinfo;
@@ -1732,8 +2030,13 @@ ULONG xhciInitEP(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
         UBYTE ival = xhciCalcInterval(interval, flags, type);
         if(ival)
             ep->ctx[0] |= ((ULONG)ival << 16);
-    } else
+    } else {
         devCtx->dc_EP0MaxPacket = maxpacket;
+        /* Average TRB Length is not optional for EP0: eight per the
+           specification. A controller that checks it rejects Address
+           Device with a parameter error. */
+        ep->length = 8;
+    }
 
     /*
      * Endpoint Context DW1 programming:
@@ -1837,41 +2140,12 @@ LONG xhciPrepareEndpoint(struct IOUsbHWReq *ioreq)
         return UHIOERR_HOSTERROR;
     }
 
-    /*
-     * EP0 max packet size can change after the initial 8-byte device descriptor
-     * read (FS: 8/16/32/64). We must update the EP0 endpoint context when the
-     * stack learns the real bMaxPacketSize0, otherwise subsequent control
-     * transfers may complete with incorrect/empty data.
-     */
-    if((ioreq->iouh_Endpoint == 0) &&
-            (ioreq->iouh_MaxPktSize != 0) &&
-            ((ULONG)ioreq->iouh_MaxPktSize != devCtx->dc_EP0MaxPacket)) {
-        pciusbXHCIDebugEP("xHCI",
-                          DEBUGCOLOR_SET "Updating EP0 MPS: %lu -> %u (DevAddr=%u, Slot=%ld)" DEBUGCOLOR_RESET"\n",
-                          devCtx->dc_EP0MaxPacket,
-                          ioreq->iouh_MaxPktSize,
-                          ioreq->iouh_DevAddr,
-                          devCtx->dc_SlotID);
-
-        (void)xhciInitEP(hc, devCtx,
-                         ioreq,
-                         0, 0,
-                         UHCMD_CONTROLXFER,
-                         ioreq->iouh_MaxPktSize,
-                         0,
-                         ioreq->iouh_Flags);
-
-        LONG cc = xhciCmdEndpointConfigure(hc, devCtx->dc_SlotID, devCtx->dc_IN.dmaa_Ptr,
-                                           timerreq);
-        if(cc != TRB_CC_SUCCESS) {
-            pciusbWarn("xHCI",
-                       DEBUGWARNCOLOR_SET "EP0 reconfigure failed (cc=%d)" DEBUGCOLOR_RESET"\n", cc);
-            if(epctx_allocated) {
-                xhciCloseTaskTimer(&epctx->ectx_TimerPort, &epctx->ectx_TimerReq);
-                FreeMem(epctx, sizeof(*epctx));
-            }
-            return UHIOERR_HOSTERROR;
+    if(!xhciUpdateEP0MaxPacket(hc, devCtx, ioreq, timerreq)) {
+        if(epctx_allocated) {
+            xhciCloseTaskTimer(&epctx->ectx_TimerPort, &epctx->ectx_TimerReq);
+            FreeMem(epctx, sizeof(*epctx));
         }
+        return UHIOERR_HOSTERROR;
     }
 
     ULONG epid = xhciEndpointID(ioreq->iouh_Endpoint,
@@ -2085,6 +2359,17 @@ static inline void xhciIOErrfromCC(struct IOUsbHWReq *ioreq, ULONG cc)
             ioreq->iouh_Actual = ioreq->iouh_Length;
         break;
 
+    case TRB_CC_SHORT_PACKET:
+        /*
+         * A device answering with less than was asked for is how a device
+         * says "that is all", not a failure - a boot mouse reporting four
+         * bytes into an eight byte request ends here every time. The
+         * transfer event carried the residual and the completion path has
+         * already recorded what arrived, so leave iouh_Actual alone.
+         */
+        ioreq->iouh_Req.io_Error = UHIOERR_NO_ERROR;
+        break;
+
     case TRB_CC_BABBLE_DETECTED_ERROR:                          /* Data Buffer Error / Babble */
         ioreq->iouh_Req.io_Error = UHIOERR_BABBLE;
         break;
@@ -2140,6 +2425,73 @@ static inline void xhciIOErrfromCC(struct IOUsbHWReq *ioreq, ULONG cc)
         ioreq->iouh_Req.io_Error = UHIOERR_HOSTERROR;
     }
     break;
+    }
+}
+
+static void xhciResetEndpointSequence(struct PCIController *hc, struct pciusbXHCIDevice *devCtx,
+    const UBYTE epid, struct timerequest *timerreq)
+{
+    const UWORD ctxsize = (hc->hc_Flags & HCF_CTX64) ? 64 : 32;
+    volatile UBYTE *obase = (volatile UBYTE *)devCtx->dc_SlotCtx.dmaa_Ptr;
+    volatile struct xhci_ep *epctx = (volatile struct xhci_ep *)(obase + (epid * ctxsize));
+
+    CacheClearE((APTR)epctx, ctxsize, CACRF_InvalidateD);
+    UBYTE epstate = xhciEndpointState(epctx);
+
+    if(epstate != XHCI_EP_STATE_HALTED) {
+        pciusbXHCIDebugV("xHCI",
+                         DEBUGCOLOR_SET "Skip endpoint reset: EPID=%u state=%u (not halted)" DEBUGCOLOR_RESET" \n",
+                         (unsigned)epid, (unsigned)epstate);
+        return;
+    }
+
+    pciusbXHCIDebug("xHCI",
+                    DEBUGCOLOR_SET "Reset Endpoint: slot=%u epid=%u" DEBUGCOLOR_RESET"\n",
+                    devCtx->dc_SlotID, epid);
+
+    /* Step 1: Reset Endpoint */
+    LONG cc = xhciCmdEndpointReset(hc, devCtx->dc_SlotID, epid, 0, timerreq);
+    if(cc != TRB_CC_SUCCESS) {
+        pciusbWarn("xHCI", "Reset Endpoint failed: cc=%ld\n", cc);
+        return;
+    }
+
+    /* Step 2: Reset the transfer ring */
+    APTR deqptr = NULL;
+    BOOL dcs = FALSE;
+    if(!xhciResetEndpointRing(hc, devCtx, epid, &deqptr, &dcs))
+        return;
+
+    /* Step 3: Set TR Dequeue Pointer */
+    cc = xhciCmdSetTRDequeuePtr(hc, devCtx->dc_SlotID, epid, deqptr, dcs, timerreq);
+    if(cc != TRB_CC_SUCCESS) {
+        pciusbWarn("xHCI", "Set TR Dequeue failed: cc=%ld\n", cc);
+        return;
+    }
+
+    /* Step 4: CRITICAL - Verify endpoint is no longer halted */
+    /* Invalidate cache to see controller's updated state */
+    CacheClearE((APTR)epctx, ctxsize, CACRF_InvalidateD);
+
+    ULONG edw0 = AROS_LE2LONG(epctx->ctx[0]);
+    epstate = (edw0 & 0x7U);
+
+    pciusbXHCIDebug("xHCI",
+                    "After Set TR Dequeue: epid=%u state=%u (%s)\n",
+                    epid, epstate,
+                    (epstate == 0) ? "Disabled" :
+                    (epstate == 1) ? "Running" :
+                    (epstate == 2) ? "Halted" :
+                    (epstate == 3) ? "Stopped" :
+                    (epstate == 4) ? "Error" : "Unknown");
+
+    /* Endpoint should be in Stopped (3) state after Set TR Dequeue */
+    if(epstate == 2) {
+        pciusbWarn("xHCI",
+                   DEBUGWARNCOLOR_SET
+                   "Endpoint still Halted after reset sequence! Aborting recovery."
+                   DEBUGCOLOR_RESET"\n");
+        return;
     }
 }
 
@@ -2204,68 +2556,7 @@ static void xhciHandleClearFeatureEndpointHalt(struct PCIController *hc,
     if(!devCtx->dc_SlotCtx.dmaa_Ptr)
         return;
 
-    const UWORD ctxsize = (hc->hc_Flags & HCF_CTX64) ? 64 : 32;
-    volatile UBYTE *obase = (volatile UBYTE *)devCtx->dc_SlotCtx.dmaa_Ptr;
-    volatile struct xhci_ep *epctx = (volatile struct xhci_ep *)(obase + (epid * ctxsize));
-
-    CacheClearE((APTR)epctx, ctxsize, CACRF_InvalidateD);
-    UBYTE epstate = xhciEndpointState(epctx);
-
-    if(epstate != XHCI_EP_STATE_HALTED) {
-        pciusbXHCIDebugV("xHCI",
-                         DEBUGCOLOR_SET "Skip endpoint reset: EPID=%u state=%u (not halted)" DEBUGCOLOR_RESET" \n",
-                         (unsigned)epid, (unsigned)epstate);
-        return;
-    }
-
-    pciusbXHCIDebug("xHCI",
-                    DEBUGCOLOR_SET "Reset Endpoint: slot=%u epid=%u" DEBUGCOLOR_RESET"\n",
-                    devCtx->dc_SlotID, epid);
-
-    /* Step 1: Reset Endpoint */
-    LONG cc = xhciCmdEndpointReset(hc, devCtx->dc_SlotID, epid, 0, timerreq);
-    if(cc != TRB_CC_SUCCESS) {
-        pciusbWarn("xHCI", "Reset Endpoint failed: cc=%ld\n", cc);
-        return;
-    }
-
-    /* Step 2: Reset the transfer ring */
-    APTR deqptr = NULL;
-    BOOL dcs = FALSE;
-    if(!xhciResetEndpointRing(hc, devCtx, epid, &deqptr, &dcs))
-        return;
-
-    /* Step 3: Set TR Dequeue Pointer */
-    cc = xhciCmdSetTRDequeuePtr(hc, devCtx->dc_SlotID, epid, deqptr, dcs, timerreq);
-    if(cc != TRB_CC_SUCCESS) {
-        pciusbWarn("xHCI", "Set TR Dequeue failed: cc=%ld\n", cc);
-        return;
-    }
-
-    /* Step 4: CRITICAL - Verify endpoint is no longer halted */
-    /* Invalidate cache to see controller's updated state */
-    CacheClearE((APTR)epctx, ctxsize, CACRF_InvalidateD);
-
-    ULONG edw0 = AROS_LE2LONG(epctx->ctx[0]);
-    epstate = (edw0 & 0x7U);
-
-    pciusbXHCIDebug("xHCI",
-                    "After Set TR Dequeue: epid=%u state=%u (%s)\n",
-                    epid, epstate,
-                    (epstate == 0) ? "Disabled" :
-                    (epstate == 1) ? "Running" :
-                    (epstate == 2) ? "Halted" :
-                    (epstate == 3) ? "Stopped" :
-                    (epstate == 4) ? "Error" : "Unknown");
-
-    /* Endpoint should be in Stopped (3) state after Set TR Dequeue */
-    if(epstate == 2) {
-        pciusbWarn("xHCI",
-                   DEBUGWARNCOLOR_SET
-                   "Endpoint still Halted after reset sequence! Aborting recovery."
-                   DEBUGCOLOR_RESET"\n");
-        return;
-    }
+    xhciResetEndpointSequence(hc, devCtx, epid, timerreq);
 
     /* Recovery complete: endpoint is in Stopped state and ready to accept
      * new TRBs.  The next doorbell ring (when a transfer is submitted) will
@@ -2484,7 +2775,7 @@ void xhciHandleFinishedTDs(struct PCIController *hc, struct timerequest *timerre
                                DEBUGCOLOR_RESET"\n",
                                ioreq->iouh_DevAddr, epid);
 
-                    xhciCmdEndpointReset(hc, devCtx->dc_SlotID, epid, 0, timerreq);
+                    xhciResetEndpointSequence(hc, devCtx, epid, timerreq);
                 }
             }
 
@@ -2495,6 +2786,21 @@ void xhciHandleFinishedTDs(struct PCIController *hc, struct timerequest *timerre
                         (ioreq->iouh_Req.io_Command == UHCMD_CONTROLXFER)) {
                     xhciHandleClearFeatureEndpointHalt(hc, ioreq, clear_dev, timerreq);
                     uhwCheckSpecialCtrlTransfers(hc, ioreq);
+
+                    /*
+                     * A hub descriptor going by names the hub's port count,
+                     * which the slot context needs when a split-transaction
+                     * child is addressed through this hub later.
+                     */
+                    if(clear_dev && clear_dev != XHCI_ROOT_HUB_HANDLE &&
+                            ioreq->iouh_SetupData.bmRequestType ==
+                                (URTF_IN | URTF_CLASS | URTF_DEVICE) &&
+                            ioreq->iouh_SetupData.bRequest == USR_GET_DESCRIPTOR &&
+                            ioreq->iouh_Data && ioreq->iouh_Actual >= 3) {
+                        UWORD dtype = AROS_LE2WORD(ioreq->iouh_SetupData.wValue) >> 8;
+                        if(dtype == UDT_HUB || dtype == UDT_SSHUB)
+                            clear_dev->dc_NbrPorts = ((UBYTE *)ioreq->iouh_Data)[2];
+                    }
                 }
                 ReplyMsg(&ioreq->iouh_Req.io_Message);
             }
@@ -2548,8 +2854,8 @@ BOOL xhciIntWorkProcess(struct PCIController *hc, struct IOUsbHWReq *ioreq, ULON
 
         driprivate->dpCC = ccode;
 
-        /* Avoid log storms for expected ISO conditions */
-        if((ccode != TRB_CC_SUCCESS) &&
+        /* Avoid log storms for expected ISO conditions and short packets */
+        if((ccode != TRB_CC_SUCCESS) && (ccode != TRB_CC_SHORT_PACKET) &&
                 !(ccode == TRB_CC_RING_UNDERRUN && (ioreq->iouh_Req.io_Command == UHCMD_ISOXFER))) {
             pciusbWarn("xHCI",
                        DEBUGWARNCOLOR_SET
@@ -2562,7 +2868,7 @@ BOOL xhciIntWorkProcess(struct PCIController *hc, struct IOUsbHWReq *ioreq, ULON
          * This is particularly useful to spot endpoints that remain HALTED /
          * STOPPED while new TDs are being submitted.
          */
-        if((ccode != TRB_CC_SUCCESS) &&
+        if((ccode != TRB_CC_SUCCESS) && (ccode != TRB_CC_SHORT_PACKET) &&
                 !(ccode == TRB_CC_RING_UNDERRUN && (ioreq->iouh_Req.io_Command == UHCMD_ISOXFER))) {
             xhciDiagDumpEndpointBrief(hc, driprivate->dpDevice, (UBYTE)driprivate->dpEPID, "completion-error");
             xhciDumpEndpointCtx(hc, driprivate->dpDevice, driprivate->dpEPID, "completion-error");
@@ -3019,8 +3325,17 @@ static AROS_INTH1(xhciIntCode, struct PCIController *, hc)
                 }
 
                 if(!req) {
-                    /* Avoid log storms for expected endpoint-level ISO conditions */
-                    if(trbe_ccode != TRB_CC_RING_UNDERRUN) {
+                    /*
+                     * Avoid log storms for expected endpoint-level ISO
+                     * conditions, and for the three Stopped codes: those
+                     * report what a queued TRB was doing when the endpoint
+                     * was halted, which arrives after the request it
+                     * belonged to has already been failed and reaped.
+                     */
+                    if((trbe_ccode != TRB_CC_RING_UNDERRUN) &&
+                       (trbe_ccode != TRB_CC_STOPPED) &&
+                       (trbe_ccode != TRB_CC_STOPPED_LENGTH_INVALID) &&
+                       (trbe_ccode != TRB_CC_STOPPED_SHORT_PACKET)) {
                         pciusbWarn("xHCI",
                                    DEBUGWARNCOLOR_SET
                                    "TRANSFER EVT: slot=%u epid=%u idx=%lu cc=%lu missing ioreq"
@@ -3052,6 +3367,7 @@ static AROS_INTH1(xhciIntCode, struct PCIController *, hc)
                 }
 
                 if(trbe_ccode != TRB_CC_SUCCESS &&
+                        trbe_ccode != TRB_CC_SHORT_PACKET &&
                         trbe_slot < USB_DEV_MAX && trbe_epid < MAX_DEVENDPOINTS &&
                         devCtx && ring && have_idx) {
                     UBYTE *cnt = &xhci_diag_cc_err[trbe_slot][trbe_epid];
@@ -3270,7 +3586,7 @@ static AROS_INTH1(xhciIntCode, struct PCIController *, hc)
             next_dma  = (UQUAD)(IPTR)xhcic->xhc_DMAERS;
             next_dma += (UQUAD)(idx) * (UQUAD)sizeof(struct xhci_trb);
 
-            xhciSetPointer(hc, ir->erdp, (IPTR)(next_dma | (UQUAD)XHCIF_IR_ERDP_EHB));
+            xhciSetPointerMMIO(hc, ir->erdp, (IPTR)(next_dma | (UQUAD)XHCIF_IR_ERDP_EHB));
         }
 
         if(maxwork == 0) {
@@ -3358,13 +3674,35 @@ void xhciReset(struct PCIController *hc, struct PCIUnit *hu,
                    (status & XHCIF_USBSTS_HCE) ? " HCE" : "",
                    (status & XHCIF_USBSTS_HSE) ? " HSE" : "");
 
+    /*
+     * Stop it before resetting it. A controller taken over from
+     * firmware still holds that firmware's queue pointers, and one that
+     * is reset while it is running keeps fetching through them - into
+     * memory that has since been reclaimed.
+     */
+    pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Halting Controller..." DEBUGCOLOR_RESET" \n");
+    hcopr->usbcmd = AROS_LONG2LE(0);
+    cnt = 100;
+    while(!(AROS_LE2LONG(hcopr->usbsts) & XHCIF_USBSTS_HCH) && (--cnt > 0))
+        uhwDelayMS(1, timerreq);
+    if(!(AROS_LE2LONG(hcopr->usbsts) & XHCIF_USBSTS_HCH))
+        pciusbWarn("xHCI", DEBUGWARNCOLOR_SET "Controller will not halt (USBSTS $%08x)" DEBUGCOLOR_RESET" \n",
+                   AROS_LE2LONG(hcopr->usbsts));
+
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Resetting Controller..." DEBUGCOLOR_RESET" \n");
     hcopr->usbcmd = AROS_LONG2LE(XHCIF_USBCMD_HCRST);
 
-    // Wait for the command to be accepted..
+    /*
+     * Wait before looking, not after. The reset bit does not read back
+     * as set the instant it is written, so a poll that reads first sees
+     * a reset that has not started yet as one already finished - and
+     * everything programmed after that is discarded by the reset when
+     * it does begin.
+     */
     cnt = 100;
-    while((AROS_LE2LONG(hcopr->usbcmd) & XHCIF_USBCMD_HCRST) && (--cnt > 0))
+    do {
         uhwDelayMS(2, timerreq);
+    } while((AROS_LE2LONG(hcopr->usbcmd) & XHCIF_USBCMD_HCRST) && (--cnt > 0));
 
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "COMMAND = $%08x, after %ums" DEBUGCOLOR_RESET" \n", AROS_LE2LONG(hcopr->usbcmd),
                     (100 - cnt) << 1);
@@ -3377,10 +3715,11 @@ void xhciReset(struct PCIController *hc, struct PCIUnit *hu,
                    (status & XHCIF_USBSTS_HCE) ? " HCE" : "",
                    (status & XHCIF_USBSTS_HSE) ? " HSE" : "");
 
-    // Wait for the reset to complete..
+    /* Same again for "controller not ready" - delay, then look */
     cnt = 100;
-    while((AROS_LE2LONG(hcopr->usbsts) & XHCIF_USBSTS_CNR) && (--cnt > 0))
+    do {
         uhwDelayMS(2, timerreq);
+    } while((AROS_LE2LONG(hcopr->usbsts) & XHCIF_USBSTS_CNR) && (--cnt > 0));
 
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "USBSTS = $%08x, after %ums" DEBUGCOLOR_RESET" \n", AROS_LE2LONG(hcopr->usbsts),
                     (100 - cnt) << 1);
@@ -3390,10 +3729,10 @@ void xhciReset(struct PCIController *hc, struct PCIUnit *hu,
 
     hcopr->config = AROS_LONG2LE(xhcic->xhc_NumSlots);
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "  Setting DCBAA to 0x%p" DEBUGCOLOR_RESET" \n", xhcic->xhc_DMADCBAA);
-    xhciSetPointer(hc, hcopr->dcbaap, xhcic->xhc_DMADCBAA);
+    xhciSetPointerMMIO(hc, hcopr->dcbaap, xhcic->xhc_DMADCBAA);
     xhciDumpStatus(AROS_LE2LONG(hcopr->usbsts));
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "  Setting CRCR to 0x%p" DEBUGCOLOR_RESET" \n", xhcic->xhc_DMAOPR);
-    xhciSetPointer(hc, hcopr->crcr, ((IPTR)xhcic->xhc_DMAOPR | 1));
+    xhciSetPointerMMIO(hc, hcopr->crcr, ((IPTR)xhcic->xhc_DMAOPR | 1));
 
     volatile struct pcisusbXHCIRing *xring = (volatile struct pcisusbXHCIRing *)xhcic->xhc_OPRp;
     xhciInitRing(hc, (struct pcisusbXHCIRing *)xring);
@@ -3405,15 +3744,33 @@ void xhciReset(struct PCIController *hc, struct PCIUnit *hu,
 
     erseg->size = AROS_LONG2LE(XHCI_EVENT_RING_TRBS);
 
+    /*
+     * The segment has to be ready before ERSTBA is written - that write
+     * is what sends the controller to fetch the table and start using
+     * the ring, so anything done to it afterwards is done underneath a
+     * controller already reading it.
+     */
+    xring = (volatile struct pcisusbXHCIRing *)xhcic->xhc_ERSp;
+    xhciInitRing(hc, (struct pcisusbXHCIRing *)xring);
+
     volatile struct xhci_ir *xhciir = (volatile struct xhci_ir *)((IPTR)xhcic->xhc_XHCIIntR);
     xhciir->erstsz = AROS_LONG2LE(1);
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "  Setting ERDP to 0x%p" DEBUGCOLOR_RESET" \n", xhcic->xhc_DMAERS);
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "  Setting ERSTBA to 0x%p" DEBUGCOLOR_RESET" \n", xhcic->xhc_DMAERST);
-    xhciSetPointer(hc, xhciir->erdp, ((IPTR)xhcic->xhc_DMAERS | (IPTR)XHCIF_IR_ERDP_EHB));
-    xhciSetPointer(hc, xhciir->erstba, ((IPTR)xhcic->xhc_DMAERST));
+    xhciSetPointerMMIO(hc, xhciir->erdp, ((IPTR)xhcic->xhc_DMAERS | (IPTR)XHCIF_IR_ERDP_EHB));
+    xhciSetPointerMMIO(hc, xhciir->erstba, ((IPTR)xhcic->xhc_DMAERST));
 
-    xring = (volatile struct pcisusbXHCIRing *)xhcic->xhc_ERSp;
-    xhciInitRing(hc, (struct pcisusbXHCIRing *)xring);
+    pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET
+               "readback: erstsz %08lx erstba %08lx%08lx erdp %08lx%08lx dcbaap %08lx%08lx usbsts %08lx"
+               DEBUGCOLOR_RESET" \n",
+               (unsigned long)AROS_LE2LONG(xhciir->erstsz),
+               (unsigned long)AROS_LE2LONG(xhciir->erstba.addr_hi),
+               (unsigned long)AROS_LE2LONG(xhciir->erstba.addr_lo),
+               (unsigned long)AROS_LE2LONG(xhciir->erdp.addr_hi),
+               (unsigned long)AROS_LE2LONG(xhciir->erdp.addr_lo),
+               (unsigned long)AROS_LE2LONG(hcopr->dcbaap.addr_hi),
+               (unsigned long)AROS_LE2LONG(hcopr->dcbaap.addr_lo),
+               (unsigned long)AROS_LE2LONG(hcopr->usbsts));
     /*
      * MSI/MSI-X is edge-triggered in practice: if IP/EINT are already set
      * when USBCMD.INTE becomes 1, some controllers will not emit a new MSI.
@@ -3431,12 +3788,61 @@ void xhciReset(struct PCIController *hc, struct PCIUnit *hu,
     xhciDumpIR(xhciir);
 }
 
+static void xhciLynxPointQuirk(struct PCIController *hc, struct timerequest *timerreq)
+{
+     /*
+     * Warm-reset all SuperSpeed ports to fully activate the SS PHY.
+     */
+    struct XhciHCPrivate *xhcic = xhciGetHCPrivate(hc);
+    volatile struct xhci_pr *xhciports = (volatile struct xhci_pr *)((IPTR)xhcic->xhc_XHCIPorts);
+    UWORD hciport;
+
+    pciusbWarn("xHCI", DEBUGCOLOR_SET "Intel LynxPoint Quirk!" DEBUGCOLOR_RESET" \n");
+
+    for(hciport = 0; hciport < hc->hc_NumPorts; hciport++) {
+        if(xhcic->xhc_PortProtocol[hciport] != XHCI_PORT_PROTOCOL_USB3)
+            continue;
+
+        ULONG portsc = AROS_LE2LONG(xhciports[hciport].portsc);
+        UWORD cnt;
+
+        /* Port must be powered */
+        if(!(portsc & XHCIF_PR_PORTSC_PP))
+            continue;
+
+        /*
+            * If the link is already in U0 the PHY is active and a warm
+            * reset is unnecessary (and disruptive).  Skip it.
+            */
+        if(xhciUsb3Operational(portsc))
+            continue;
+
+        /* Issue the warm reset */
+        xhciports[hciport].portsc = AROS_LONG2LE(portsc | XHCIF_PR_PORTSC_WPR);
+        (void)AROS_LE2LONG(xhciports[hciport].portsc);
+
+        /* Wait for the controller to report reset complete (WRC) */
+        cnt = 200;
+        while(--cnt > 0) {
+            uhwDelayMS(5, timerreq);
+            portsc = AROS_LE2LONG(xhciports[hciport].portsc);
+            if(portsc & XHCIF_PR_PORTSC_WRC)
+                break;
+        }
+
+        /* Allow link training time to settle */
+        uhwDelayMS(50, timerreq);
+    }
+
+}
+
 BOOL xhciInit(struct PCIController *hc, struct PCIUnit *hu,
               struct timerequest *timerreq)
 {
     struct XhciHCPrivate *xhcic = xhciGetHCPrivate(hc);
     ULONG val;
     ULONG cnt;
+    ULONG attempt;
 
 
     struct Library *ps;
@@ -3444,6 +3850,17 @@ BOOL xhciInit(struct PCIController *hc, struct PCIUnit *hu,
         return FALSE;
     }
     if(!xhcic) {
+        CloseLibrary(ps);
+        return FALSE;
+    }
+
+    /*
+     * Controllers are set up one at a time but taken from the unit's
+     * list as a whole, so one that failed to map its registers still
+     * arrives here - and everything below reaches through that mapping.
+     */
+    if(!hc->hc_RegBase || !xhcic->xhc_XHCIOpR) {
+        pciusbWarn("xHCI", DEBUGCOLOR_SET "Controller @ 0x%p has no register mapping - skipping" DEBUGCOLOR_RESET" \n", hc);
         CloseLibrary(ps);
         return FALSE;
     }
@@ -3516,6 +3933,9 @@ BOOL xhciInit(struct PCIController *hc, struct PCIUnit *hu,
 
     /* Ensure ports are powered per xHCI spec before enabling interrupts */
     xhciPowerOnRootPorts(hc, hu, timerreq);
+
+    if(hc->hc_Quirks & HCQF_LYNXPOINT)
+        xhciLynxPointQuirk(hc, timerreq);
 
     /* Enable interrupts in the xhci */
     {
@@ -3593,13 +4013,98 @@ BOOL xhciInit(struct PCIController *hc, struct PCIUnit *hu,
     volatile struct xhci_ir *xhciir = (volatile struct xhci_ir *)((IPTR)xhcic->xhc_XHCIIntR);
     xhciir->iman = AROS_LONG2LE(XHCIF_IR_IMAN_IE);
 
-    /* Finally, set the "run" bit */
-    pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Starting controller run state..." DEBUGCOLOR_RESET" \n");
-    val = AROS_LE2LONG(hcopr->usbcmd);
-    val |= XHCIF_USBCMD_RS | XHCIF_USBCMD_INTE;
-    hcopr->usbcmd = AROS_LONG2LE(val);
-    pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "USBCMD = $%08x..." DEBUGCOLOR_RESET" \n",
-                    AROS_LE2LONG(hcopr->usbcmd));
+    /*
+     * Start it, and be prepared to start it again.
+     *
+     * A controller handed over from firmware that was driving it does
+     * not always come out of reset settled, and the first transaction
+     * it issues can be answered with an error. That latches HSE and
+     * halts it for good - which then looks like a dead controller,
+     * although a further reset clears it and the next attempt succeeds.
+     */
+    for (attempt = 0; ; attempt++)
+    {
+        if (attempt)
+        {
+            pciusbWarn("xHCI", DEBUGWARNCOLOR_SET "Restarting after a failed start (attempt %u)" DEBUGCOLOR_RESET" \n",
+                       attempt + 1);
+            /* The error bits are write-one-to-clear */
+            hcopr->usbsts = AROS_LONG2LE(XHCIF_USBSTS_HSE | XHCIF_USBSTS_HCE);
+            uhwDelayMS(20, timerreq);
+
+            xhciReset(hc, hu, timerreq);
+            xhciir->iman = AROS_LONG2LE(XHCIF_IR_IMAN_IE);
+        }
+
+        pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Starting controller run state..." DEBUGCOLOR_RESET" \n");
+        val = AROS_LE2LONG(hcopr->usbcmd);
+        val |= XHCIF_USBCMD_RS | XHCIF_USBCMD_INTE;
+        hcopr->usbcmd = AROS_LONG2LE(val);
+        pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "USBCMD = $%08x..." DEBUGCOLOR_RESET" \n",
+                        AROS_LE2LONG(hcopr->usbcmd));
+
+        /*
+         * Running is what the controller says it is, not what was asked
+         * for. HCH drops only once it has actually started, and one that
+         * will not leave the halted state executes nothing queued
+         * afterwards - every command then fails by timing out, a long
+         * way from the cause.
+         */
+        cnt = 100;
+        while((AROS_LE2LONG(hcopr->usbsts) & XHCIF_USBSTS_HCH) && (--cnt > 0))
+            uhwDelayMS(2, timerreq);
+
+        val = AROS_LE2LONG(hcopr->usbsts);
+        pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "USBSTS = $%08x, after %ums" DEBUGCOLOR_RESET" \n",
+                        val, (100 - cnt) << 1);
+        xhciDumpStatus(val);
+
+        if(!(val & XHCIF_USBSTS_HCH) || attempt >= 2)
+            break;
+    }
+
+    if(val & XHCIF_USBSTS_HCH) {
+        pciusbWarn("xHCI", DEBUGWARNCOLOR_SET "Controller will not leave the halted state (USBCMD $%08x, USBSTS $%08x)%s%s" DEBUGCOLOR_RESET" \n",
+                   AROS_LE2LONG(hcopr->usbcmd), val,
+                   (val & XHCIF_USBSTS_HCE) ? " HCE" : "",
+                   (val & XHCIF_USBSTS_HSE) ? " HSE" : "");
+        /*
+         * HSE is raised for an error response to one of the
+         * controller's own transactions, so what the function recorded
+         * about that transaction says far more than the halt does.
+         */
+        {
+            UWORD cmd = READCONFIGWORD(hc, hc->hc_PCIDeviceObject, 0x04);
+            UWORD sts = READCONFIGWORD(hc, hc->hc_PCIDeviceObject, 0x06);
+
+            pciusbWarn("xHCI", DEBUGWARNCOLOR_SET "  PCI command $%04x status $%04x -%s%s%s%s%s" DEBUGCOLOR_RESET" \n",
+                       cmd, sts,
+                       (cmd & (1 << 2)) ? " busmaster" : " NO-BUSMASTER",
+                       (sts & (1 << 13)) ? " master-abort" : "",
+                       (sts & (1 << 12)) ? " target-abort" : "",
+                       (sts & (1 << 14)) ? " system-error" : "",
+                       (sts & (1 << 15)) ? " parity-error" : "");
+        }
+        return FALSE;
+    }
+
+    /*
+     * A port can already be populated before we ever touch the
+     * controller. Firmware that booted from USB leaves the device
+     * attached and running, and the change it announced itself with
+     * was answered long ago - resetting and acknowledging the stale
+     * change bits leaves the port sitting in a steady connected state
+     * with nothing further to report, so the port task would wait on
+     * an event that has already been and gone. Ask it for one pass
+     * now. It has to be here rather than at the head of the task:
+     * enumeration issues commands, and a command written to the ring
+     * while the controller is still halted is discarded with the
+     * doorbell that announced it.
+     */
+    if(xhcic->xhc_PortTask.xpt_Task && xhcic->xhc_PortTask.xpt_PortChangeSignal != -1) {
+        Signal(xhcic->xhc_PortTask.xpt_Task,
+               1L << xhcic->xhc_PortTask.xpt_PortChangeSignal);
+    }
 
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "xhciInit returns TRUE..." DEBUGCOLOR_RESET" \n");
     return TRUE;
@@ -3637,8 +4142,17 @@ static void xhciFreeEndpointContext(struct PCIController *hc,
          * This avoids controllers/emulators fetching TRBs from freed memory.
          */
         if(stopEndpoint && devCtx->dc_SlotID) {
-            (void)xhciCmdEndpointStop(hc, devCtx->dc_SlotID, epid, TRUE, timerreq);
-            (void)xhciCmdEndpointReset(hc, devCtx->dc_SlotID, epid, 0, timerreq);
+            UBYTE epstate = xhciEndpointStateOf(hc, devCtx, epid);
+
+            /*
+             * Both commands land the endpoint in Stopped, but only one
+             * of them is legal from where it is now - a device pulled
+             * mid-transfer leaves its endpoints Halted, not Running.
+             */
+            if(epstate == XHCI_EP_STATE_HALTED)
+                (void)xhciCmdEndpointReset(hc, devCtx->dc_SlotID, epid, 0, timerreq);
+            else if(epstate == XHCI_EP_STATE_RUNNING)
+                (void)xhciCmdEndpointStop(hc, devCtx->dc_SlotID, epid, TRUE, timerreq);
 
             /*
              * EP0 (EPID=1) is mandatory and must not be dropped via Configure

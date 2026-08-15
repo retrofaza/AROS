@@ -240,6 +240,11 @@ struct NepClassHid * GM_UNIQUENAME(usbForceInterfaceBinding)(struct NepHidBase *
                     return(nch);
                 }
             }
+            psdAddErrorMsg(RETURN_ERROR, (STRPTR) GM_UNIQUENAME(libname),
+                           "binding FAILED '%s' if=%s: %s",
+                           devname, ifidstr,
+                           tmptask ? (STRPTR) "task died during init"
+                                   : (STRPTR) "psdSpawnSubTask failed");
             nch->nch_ReadySigTask = NULL;
             //FreeSignal(nch->nch_ReadySignal);
             psdFreeVec(nch->nch_CDC);
@@ -902,7 +907,11 @@ AROS_UFH0(void, GM_UNIQUENAME(nHidTask))
                             {
                                 wacomgood = nParseWacom(nch, buf, buflen);
                             }
-                            if(!wacomgood)
+                            /*
+                             * A zero-length reply (USB ZLP / buflen=0)
+                             * means "device has nothing to report".
+                             */
+                            if(!wacomgood && buflen > 0)
                             {
                                 // if the parser failed, use standard methods
                                 if(nch->nch_UsesReportID)
@@ -2918,11 +2927,16 @@ BOOL nParseReport(struct NepClassHid *nch, struct NepHidReport *nhr)
                                                 nhi->nhi_LogicalMin = nch->nch_HidGlobal.nhg_LogicalMin;
                                                 nhi->nhi_LogicalMax = nch->nch_HidGlobal.nhg_LogicalMax;
 
+                                                if((nhi->nhi_LogicalMin > nhi->nhi_LogicalMax) || ((nhi->nhi_LogicalMax - nhi->nhi_LogicalMin) > 65535))
+                                                {
+                                                    KPRINTF(10, ("Invalid HID logical range %ld..%ld, capping\n", nhi->nhi_LogicalMin, nhi->nhi_LogicalMax));
+                                                    nhi->nhi_LogicalMax = nhi->nhi_LogicalMin;
+                                                }
                                                 nhi->nhi_MapSize = (nhi->nhi_LogicalMax - nhi->nhi_LogicalMin)+1;
                                                 nhi->nhi_UsageMap = psdAllocVec(sizeof(ULONG) * nhi->nhi_MapSize);
                                                 nhi->nhi_ActionMap = psdAllocVec(sizeof(struct List) * nhi->nhi_MapSize);
+                                                if(nhi->nhi_Count > 65535) nhi->nhi_Count = 1;
                                                 nhi->nhi_Buffer = psdAllocVec(2 * sizeof(LONG) * nhi->nhi_Count);
-                                                nhi->nhi_OldBuffer = &nhi->nhi_Buffer[nhi->nhi_Count];
                                                 nhi->nhi_PhysicalMin = nch->nch_HidGlobal.nhg_PhysicalMin;
                                                 nhi->nhi_PhysicalMax = nch->nch_HidGlobal.nhg_PhysicalMax;
                                                 nhi->nhi_UnitExp = nch->nch_HidGlobal.nhg_UnitExp;
@@ -2941,6 +2955,7 @@ BOOL nParseReport(struct NepClassHid *nch, struct NepHidReport *nhr)
                                                     break;
                                                 }
 
+                                                nhi->nhi_OldBuffer = &nhi->nhi_Buffer[nhi->nhi_Count];
                                                 nhi->nhi_Usage = nhi->nhi_DesignIndex = nhi->nhi_StringIndex = HID_PARAM_UNDEF;
                                                 NewList(&nhi->nhi_ActionList);
 
@@ -7452,4 +7467,3 @@ LONG nEasyRequestA(struct NepHidBase *nh, STRPTR body, STRPTR gadgets, RAWARG pa
     return(EasyRequestArgs(NULL, &es, NULL, params));
 }
 /* \\\ */
-

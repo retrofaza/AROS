@@ -79,8 +79,33 @@ static BOOL XHCIController__Init(struct PCIController *hc)
     hc->hc_CPrivate = xhcic;
 
     /* Initialize hardware... */
-    OOP_GetAttr(hc->hc_PCIDeviceObject, aHidd_PCIDevice_Base0, (IPTR *)&hc->hc_RegBase);
+    {
+        IPTR barbase, barsize;
+
+        OOP_GetAttr(hc->hc_PCIDeviceObject, aHidd_PCIDevice_Base0, &barbase);
+        OOP_GetAttr(hc->hc_PCIDeviceObject, aHidd_PCIDevice_Size0, &barsize);
+
+        /* The BAR holds a bus address, which is not the CPU address on
+           every host bridge, so let the driver translate it. */
+        hc->hc_RegBase = MAPPCI(hc, hc->hc_PCIDriverObject, (APTR)barbase, (ULONG)barsize);
+    }
     xhciregs = (volatile struct xhci_hccapr *)hc->hc_RegBase;
+
+    if (!xhciregs) {
+        pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Failed to map the register area" DEBUGCOLOR_RESET" \n");
+        /*
+         * Leave nothing behind. Anything running later reaches the
+         * private through hc_CPrivate, and one that was merely
+         * allocated looks no different from one that was set up - every
+         * register pointer in it is still NULL.
+         */
+        hc->hc_CPrivate = NULL;
+        FreeMem(xhcic, sizeof(*xhcic));
+        xhciCloseTaskTimer(&timerport, &timerreq);
+        return FALSE;
+    }
+
+    OOP_SetAttrs(hc->hc_PCIDeviceObject, (struct TagItem *)pciMemEnableAttrs); /* activate memory */
 
     if(hc->hc_Unit) {
         pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "Initializing hardware for unit #%d" DEBUGCOLOR_RESET" \n",
@@ -102,7 +127,6 @@ static BOOL XHCIController__Init(struct PCIController *hc)
     xhcic->xhc_XHCIIntR  = (APTR)((IPTR)xhciregs + AROS_LE2LONG(xhciregs->rrsoff) + 0x20);
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "  Interrupt Registers @ 0x%p" DEBUGCOLOR_RESET" \n", xhcic->xhc_XHCIIntR);
 
-    OOP_SetAttrs(hc->hc_PCIDeviceObject, (struct TagItem *)pciMemEnableAttrs); /* activate memory */
 
     /* Cache capability parameters once */
     ULONG hcsparams1 = AROS_LE2LONG(xhciregs->hcsparams1);
@@ -239,9 +263,7 @@ takeownership:
         xhciECPOff += nextcap << 2;
     }
 
-    IPTR vendor = 0;
-    OOP_GetAttr(hc->hc_PCIDeviceObject, aHidd_PCIDevice_VendorID, &vendor);
-    if(vendor == 0x8086) {
+    if(hc->hc_VendID == 0x8086) {
         /* Intel port routing. For chipsets exposing both EHCI and xHCI and multiplexing
            physical ports between them. Switch ports to xHCI host controller. Tested on
            H18M (0x8c31 - LynxPoint) */
@@ -257,6 +279,9 @@ takeownership:
         pciusbWarn("xHCI", DEBUGCOLOR_SET "Intel PCH: USB3PSSEN=%08lx XUSB2PR=%08lx" DEBUGCOLOR_RESET" \n",
                    READCONFIGLONG(hc, hc->hc_PCIDeviceObject, USB_INTEL_USB3_PSSEN),
                    READCONFIGLONG(hc, hc->hc_PCIDeviceObject, USB_INTEL_XUSB2PR));
+
+        if (hc->hc_ProdID == 0x8c31)
+            hc->hc_Quirks |= HCQF_LYNXPOINT;
     }
 
     UWORD xhciversion;
@@ -391,8 +416,8 @@ takeownership:
     /* Scratchpad buffer count decode (Hi/Lo per spec) */
     val = hcsparams2;
     {
-        ULONG sp_lo = (val >> 21) & 0x1F;
-        ULONG sp_hi = (val >> 27) & 0x1F;
+        ULONG sp_hi = (val >> 21) & 0x1F;
+        ULONG sp_lo = (val >> 27) & 0x1F;
         xhcic->xhc_NumScratchPads = (sp_hi << 5) | sp_lo;
     }
     pciusbXHCIDebug("xHCI", DEBUGCOLOR_SET "SPB = %u" DEBUGCOLOR_RESET" \n", xhcic->xhc_NumScratchPads);
@@ -501,12 +526,14 @@ OOP_Object *XHCIController__Root__New(OOP_Class *cl, OOP_Object *o, struct pRoot
         char name_buf[64];
         char *hardware_name = NULL;
 
-        sprintf(name_buf, strHardwareNamePrefixFmt, hc->hc_USBVersionMajor);
+        int pos;
+
+        pos = sprintf(name_buf, strHardwareNamePrefixFmt, hc->hc_USBVersionMajor);
         if(hc->hc_USBVersionMinor == 0xFF)
-            sprintf(name_buf + 10, strHardwareNameMinorUnknown);
+            pos += sprintf(name_buf + pos, strHardwareNameMinorUnknown);
         else
-            sprintf(name_buf + 10, strHardwareNameMinorFmt, hc->hc_USBVersionMinor);
-        sprintf(name_buf + 11, strHardwareNameSuffix);
+            pos += sprintf(name_buf + pos, strHardwareNameMinorFmt, hc->hc_USBVersionMinor);
+        sprintf(name_buf + pos, strHardwareNameSuffix);
 
         hardware_name = AllocVec(strlen(name_buf) + 1, MEMF_CLEAR);
         if(hardware_name != NULL) {

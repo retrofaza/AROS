@@ -279,6 +279,14 @@ struct Unit *Open_Unit(struct IOUsbHWReq *ioreq,
 }
 /* \\\ */
 
+#if defined(AROS_USE_LOGRES)
+/* These helpers only receive the controller; log through its device */
+#undef LogHandle
+#undef LogResBase
+#define LogHandle (hc->hc_LogRHandle)
+#define LogResBase (hc->hc_Device->hd_LogResBase)
+#endif
+
 struct RTIsoNode *pciusbAllocStdIsoNode(struct PCIController *hc, struct IOUsbHWReq *ioreq)
 {
     struct RTIsoNode *rtn;
@@ -331,6 +339,13 @@ void pciusbFreeStdIsoNode(struct PCIController *hc, struct RTIsoNode *rtn)
 
     FreeMem(rtn, sizeof(*rtn));
 }
+
+#if defined(AROS_USE_LOGRES)
+#undef LogHandle
+#undef LogResBase
+#define LogHandle (base->hd_LogRHandle)
+#define LogResBase (base->hd_LogResBase)
+#endif
 
 /* /// "Close_Unit()" */
 void Close_Unit(struct PCIDevice *base,
@@ -1023,10 +1038,15 @@ WORD cmdIntXFerRootHub(struct IOUsbHWReq *ioreq,
         if((unit->hu_RootHubPorts < 8) || (ioreq->iouh_Length == 1)) {
             *((UBYTE *) ioreq->iouh_Data) = unit->hu_RootPortChanges;
             ioreq->iouh_Actual = 1;
-        } else {
+        } else if((unit->hu_RootHubPorts < 16) || (ioreq->iouh_Length == 2)) {
             ((UBYTE *) ioreq->iouh_Data)[0] = unit->hu_RootPortChanges;
             ((UBYTE *) ioreq->iouh_Data)[1] = unit->hu_RootPortChanges >> 8;
             ioreq->iouh_Actual = 2;
+        } else {
+            ((UBYTE *) ioreq->iouh_Data)[0] = unit->hu_RootPortChanges;
+            ((UBYTE *) ioreq->iouh_Data)[1] = unit->hu_RootPortChanges >> 8;
+            ((UBYTE *) ioreq->iouh_Data)[2] = unit->hu_RootPortChanges >> 16;
+            ioreq->iouh_Actual = 3;
         }
         unit->hu_RootPortChanges = 0;
         return(0);
@@ -1073,7 +1093,9 @@ WORD cmdControlXFer(struct IOUsbHWReq *ioreq,
 
     hc = unit->hu_DevControllers[ioreq->iouh_DevAddr];
     if(!hc) {
-        KPRINTF(20, "No Host controller assigned to device address %ld\n", ioreq->iouh_DevAddr);
+        pciusbWarn("UHW",
+                   DEBUGWARNCOLOR_SET "No host controller assigned to device address %lu"
+                   DEBUGCOLOR_RESET "\n", (ULONG)ioreq->iouh_DevAddr);
         return(UHIOERR_HOSTERROR);
     }
 
@@ -1130,7 +1152,9 @@ WORD cmdBulkXFer(struct IOUsbHWReq *ioreq,
 
     hc = unit->hu_DevControllers[ioreq->iouh_DevAddr];
     if(!hc) {
-        KPRINTF(20, "No Host controller assigned to device address %ld\n", ioreq->iouh_DevAddr);
+        pciusbWarn("UHW",
+                   DEBUGWARNCOLOR_SET "No host controller assigned to device address %lu"
+                   DEBUGCOLOR_RESET "\n", (ULONG)ioreq->iouh_DevAddr);
         return(UHIOERR_HOSTERROR);
     }
 
@@ -1187,7 +1211,9 @@ WORD cmdIsoXFer(struct IOUsbHWReq *ioreq,
 
     hc = unit->hu_DevControllers[ioreq->iouh_DevAddr];
     if(!hc) {
-        KPRINTF(20, "No Host controller assigned to device address %ld\n", ioreq->iouh_DevAddr);
+        pciusbWarn("UHW",
+                   DEBUGWARNCOLOR_SET "No host controller assigned to device address %lu"
+                   DEBUGCOLOR_RESET "\n", (ULONG)ioreq->iouh_DevAddr);
         return(UHIOERR_HOSTERROR);
     }
 
@@ -1245,7 +1271,9 @@ WORD cmdIntXFer(struct IOUsbHWReq *ioreq,
 
     hc = unit->hu_DevControllers[ioreq->iouh_DevAddr];
     if(!hc) {
-        KPRINTF(20, "No Host controller assigned to device address %ld\n", ioreq->iouh_DevAddr);
+        pciusbWarn("UHW",
+                   DEBUGWARNCOLOR_SET "No host controller assigned to device address %lu"
+                   DEBUGCOLOR_RESET "\n", (ULONG)ioreq->iouh_DevAddr);
         return(UHIOERR_HOSTERROR);
     }
 
@@ -1879,10 +1907,15 @@ void uhwCheckRootHubChanges(struct PCIUnit *unit)
             if((unit->hu_RootHubPorts < 8) || (ioreq->iouh_Length == 1)) {
                 *((UBYTE *) ioreq->iouh_Data) = unit->hu_RootPortChanges;
                 ioreq->iouh_Actual = 1;
-            } else {
+            } else if((unit->hu_RootHubPorts < 16) || (ioreq->iouh_Length == 2)) {
                 ((UBYTE *) ioreq->iouh_Data)[0] = unit->hu_RootPortChanges;
                 ((UBYTE *) ioreq->iouh_Data)[1] = unit->hu_RootPortChanges >> 8;
                 ioreq->iouh_Actual = 2;
+            } else {
+                ((UBYTE *) ioreq->iouh_Data)[0] = unit->hu_RootPortChanges;
+                ((UBYTE *) ioreq->iouh_Data)[1] = unit->hu_RootPortChanges >> 8;
+                ((UBYTE *) ioreq->iouh_Data)[2] = unit->hu_RootPortChanges >> 16;
+                ioreq->iouh_Actual = 3;
             }
             ReplyMsg(&ioreq->iouh_Req.io_Message);
             ioreq = (struct IOUsbHWReq *) unit->hu_RHIOQueue.lh_Head;
@@ -1919,8 +1952,13 @@ void uhwCheckSpecialCtrlTransfers(struct PCIController *hc, struct IOUsbHWReq *i
         for(epnum = 0; epnum < 31; epnum++) {
             unit->hu_DevDataToggle[adr + epnum] = 0;
         }
-        // transfer host controller ownership
-        unit->hu_DevControllers[ioreq->iouh_DevAddr] = NULL;
+        /* Transfer host controller ownership. The request still carries the
+           default address, and index 0 belongs to no single device: dropping
+           it here leaves the next device to enumerate with no controller at
+           all until a hub port reset re-arms it below, which a SuperSpeed
+           port that has already trained its link never sends. */
+        if(ioreq->iouh_DevAddr)
+            unit->hu_DevControllers[ioreq->iouh_DevAddr] = NULL;
         unit->hu_DevControllers[adr >> 5] = hc;
     } else if((ioreq->iouh_SetupData.bmRequestType == (URTF_CLASS | URTF_OTHER)) &&
               (ioreq->iouh_SetupData.bRequest == USR_SET_FEATURE) &&
