@@ -92,6 +92,9 @@ $(TARGET_ISO): $(ISO_DEPS) $(AROSDIR)/.backdrop
 	%mkdirs_q $(AROSDIR)/S
 	$(Q)$(CP) $(SRCDIR)/workbench/s/Startup-Sequence $(AROSDIR)/S/Startup-Sequence
 	$(Q)$(MKDIR) -p "$(DISTDIR)"
+	$(Q)$(IF) $(TEST) -d "$(SRCDIR)/../ADDONS" ; then \
+		$(CP) -R "$(SRCDIR)/../ADDONS/." "$(AROSDIR)/" ; \
+	fi
 	$(Q)$(ISOCMD) \
                 -o $@ \
                 $(ISOOPTIONS) \
