@@ -8,15 +8,15 @@
 #include <aros/debug.h>
 #include <string.h>
 
-#include "../include/exec/structures.h"
-#include "../include/exec/proxy_structures.h"
-#include "../include/exec/functions.h"
-#include "../include/aros/cpu.h"
-#include "../include/aros/proxy.h"
+#include "../../include/exec/structures.h"
+#include "../../include/exec/proxy_structures.h"
+#include "../../include/exec/functions.h"
+#include "../../include/aros/cpu.h"
+#include "../../include/aros/proxy.h"
 
 #include "exec_ports.h"
 
-#include "../support.h"
+#include "../../support.h"
 
 extern struct LibraryV0 *abiv0TimerBase;
 extern struct DeviceProxy *abiv0InputBase;
@@ -184,7 +184,7 @@ bug("abiv0_CloseDevice: STUB\n");
 }
 MAKE_PROXY_ARG_2(CloseDevice)
 
-#include "../include/input/structures.h"
+#include "../../include/input/structures.h"
 extern struct ExecBaseV0 *abiv0SysBase;
 
 void call_handler_on_31bit_stack(struct InterruptV0 *v0handler, APTR v0chain)
@@ -202,8 +202,6 @@ void call_handler_on_31bit_stack(struct InterruptV0 *v0handler, APTR v0chain)
         ENTER64
         "addq $8, %%rsp\n"
         "popq %%rbx\n"
-        "leave\n"
-        "ret\n"
         ::"m"(v0handler->is_Code), "m"(v0chain), "m"(v0handler->is_Data)
         : SCRATCH_REGS_64_TO_32 );
 }
@@ -278,7 +276,7 @@ AROS_UFH2(struct InputEvent *, EmulatorInputHandler,
 }
 
 #include <proto/timer.h>
-#include "../include/timer/structures.h"
+#include "../../include/timer/structures.h"
 
 extern struct Device *TimerBase;
 
