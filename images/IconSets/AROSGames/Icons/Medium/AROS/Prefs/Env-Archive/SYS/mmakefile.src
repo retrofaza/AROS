@@ -12,7 +12,7 @@ ICONS := \
 # File Icons
 ICONS += \
     def_7z def_amigaguide def_AVI def_BMP def_Drawer def_Project \
-	def_Font def_GIF def_GZ def_ILBM def_JPEG def_LZH def_LZX def_M4A def_mod def_MOV \
+	def_GIF def_GZ def_ILBM def_JPEG def_LZH def_LZX def_M4A def_mod def_MOV \
 	def_MP4 def_MP4v0 def_MPEG def_OGG def_PCX def_PNG def_RAR def_s3m def_TAR \
 	def_TIFF def_WAVE def_WMA def_xm def_ZIP \
     def_Picture def_Text def_Document def_Tool def_Authors \
