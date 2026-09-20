@@ -57,15 +57,14 @@ void __fs_fsset_sync_unix_aros(fd_set *_unix, fd_set *_aros, int arosmaxfd);
     BOOL cont = TRUE;
     ULONG rcvd = 0;
     int __selectresult = 0;
-    ULONG _tsmask = sigmask ? *sigmask : 0;
     int maxfd = nfds - 1;
     fd_set *pread = readfds; fd_set *pwrite = writefds; fd_set *perror = exceptfds;
     int timeoutiters = 0;
-    const int ITER_SLEEP = 50; /* microseconds */
+    const int ITER_SLEEP = 500; /* microseconds */
 
-    fd_set tmpreadfds;
-    fd_set tmpwritefds;
-    fd_set tmperrorfds;
+    fd_set a_u_readfds;
+    fd_set a_u_writefds;
+    fd_set a_u_errorfds;
 
     /* Timeout handling: >0, 0, NULL
         if > 0, loop for timeoutiters iterations of ITER_SLEEP length
@@ -75,36 +74,42 @@ void __fs_fsset_sync_unix_aros(fd_set *_unix, fd_set *_aros, int arosmaxfd);
     */
     if (timeout)
     {
-        timeoutiters = timeout->tv_usec / ITER_SLEEP;
+        timeoutiters = timeout->tv_sec * 1000000 + timeout->tv_usec;
+        timeoutiters /= ITER_SLEEP;
     }
 
     if (SocketBase->sb_Flags & SB_FLAG_CLIENT_IS_AROS_PROGRAM)
     {
         maxfd = -1;
-        FD_ZERO(&tmpreadfds); FD_ZERO(&tmpwritefds); FD_ZERO(&tmperrorfds);
+        FD_ZERO(&a_u_readfds); FD_ZERO(&a_u_writefds); FD_ZERO(&a_u_errorfds);
 
-        __fs_fsset_conv_aros_unix(readfds, nfds,   &tmpreadfds, &maxfd);
-        __fs_fsset_conv_aros_unix(writefds, nfds,  &tmpwritefds, &maxfd);
-        __fs_fsset_conv_aros_unix(exceptfds, nfds, &tmperrorfds, &maxfd);
-
-        pread = &tmperrorfds; pwrite = &tmpwritefds; perror = &tmperrorfds;
+        if (readfds)    { __fs_fsset_conv_aros_unix(readfds, nfds,   &a_u_readfds, &maxfd); pread = &a_u_readfds; }
+        if (writefds)   { __fs_fsset_conv_aros_unix(writefds, nfds,  &a_u_writefds, &maxfd); pwrite = &a_u_writefds; }
+        if (exceptfds)  { __fs_fsset_conv_aros_unix(exceptfds, nfds, &a_u_errorfds, &maxfd); perror = &a_u_errorfds; }
 
         if (timeout)
         {
             /* AROS timeval is 32-bit */
-            timeoutiters = timeout->tv_micro / ITER_SLEEP;
+            timeoutiters = timeout->tv_secs * 1000000 + timeout->tv_micro;
+            timeoutiters /= ITER_SLEEP;
         }
     }
 
     do
     {
-        /* do pooling with some small sleep, re-assign each iteration as select() clears _t */
+        /* do pooling with some small sleep, re-assign each iteration as select() clears arguments */
         struct timeval _t;
         _t.tv_sec  = 0;
         _t.tv_usec = (timeout == NULL || timeoutiters > 0) ? ITER_SLEEP : 0;
+        fd_set _treadfds, _twritefds, _terrorfds;
+        FD_ZERO(&_treadfds); FD_ZERO(&_twritefds); FD_ZERO(&_terrorfds);
+        if (readfds) _treadfds      = *pread;
+        if (writefds) _twritefds    = *pwrite;
+        if (exceptfds) _terrorfds   = *perror;
 
-        __selectresult = select(maxfd + 1, pread, pwrite, perror, &_t);
-        rcvd = SetSignal(0L, _tsmask);
+        __selectresult = select(maxfd + 1, &_treadfds, &_twritefds, &_terrorfds, &_t);
+        if (sigmask)
+            rcvd = SetSignal(0L, *sigmask);
 
         if (rcvd != 0 || __selectresult != 0)
         {
@@ -113,6 +118,9 @@ void __fs_fsset_sync_unix_aros(fd_set *_unix, fd_set *_aros, int arosmaxfd);
              * If select timeouts, __selectresult = 0, if found FDs, __selectresult is > 0
              * In both cases the value is good for returning even if there was signal raised
              */
+            if (readfds)    *pread = _treadfds;
+            if (writefds)   *pwrite = _twritefds;
+            if (exceptfds)  *perror = _terrorfds;
         }
 
         if (timeout)
@@ -121,16 +129,16 @@ void __fs_fsset_sync_unix_aros(fd_set *_unix, fd_set *_aros, int arosmaxfd);
             else timeoutiters--;
         }
 
-    }while (cont);
+    } while (cont);
 
     if (__selectresult >= 0 && sigmask)
         *sigmask &= rcvd;
 
     if (SocketBase->sb_Flags & SB_FLAG_CLIENT_IS_AROS_PROGRAM)
     {
-        __fs_fsset_sync_unix_aros(&tmpreadfds,  readfds, nfds);
-        __fs_fsset_sync_unix_aros(&tmpwritefds, writefds, nfds);
-        __fs_fsset_sync_unix_aros(&tmperrorfds, exceptfds, nfds);
+        if (readfds)    __fs_fsset_sync_unix_aros(&a_u_readfds,  readfds, nfds);
+        if (writefds)   __fs_fsset_sync_unix_aros(&a_u_writefds, writefds, nfds);
+        if (exceptfds)  __fs_fsset_sync_unix_aros(&a_u_errorfds, exceptfds, nfds);
     }
 
     return __selectresult;
