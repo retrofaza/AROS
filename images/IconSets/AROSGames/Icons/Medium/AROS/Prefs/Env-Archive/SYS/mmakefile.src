@@ -20,7 +20,7 @@ ICONS += \
     def_Postscript def_Presentation def_Printer def_ReadMe def_Spreadsheet \
     def_XCF def_Sound def_Keymap def_DataType def_Installer \
     def_AudioMode def_Zune def_TrueType def_Otag def_A68K def_Catalog \
-    def_Country def_Home def_MP3ID3 def_MP3  def_Lua def_AmiLua \
+    def_Country def_Home def_MP3ID3 def_MP3 def_SVG def_Lua def_AmiLua \
     def_Archive def_Python def_REXX def_NetworkHost def_UserHome def_Trashcan \
     def_PLS def_M3U def_DT64 def_Pref def_MSD def_MSI def_CDXL def_FLAC \
     def_ELF_EXE_Linux def_KickROM def_Wireless def_LHA \
