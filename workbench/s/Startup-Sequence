@@ -63,7 +63,7 @@ Copy >NIL: "ENVARC:" "ENV:" ALL NOPRO NOREQ PAT "~(def_#?.info)"
 If EXISTS "ENV:SYS/theme.var"
     Assign "THEME:" "${SYS/theme.var}"
 Else
-    Assign "THEME:" "THEMES:AROSDefault"
+    Assign "THEME:" "THEMES:AROSGames"
 EndIf
 If EXISTS "THEME:Images"
     Assign "IMAGES:"  "THEME:Images" PREPEND
